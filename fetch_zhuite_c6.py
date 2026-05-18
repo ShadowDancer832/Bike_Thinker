@@ -2,35 +2,47 @@
 抓取腾讯文档「骓特C6」并整理为列表形式。
 
 工作原理：
-    使用 Playwright 启动一个 **持久化上下文**（persistent context），
-    直接复用本机浏览器（Edge/Chrome）的用户目录，从而带上你已经登录好的
-    腾讯文档 Cookie。脚本会：
+    使用 Playwright 启动浏览器，并 **复用本机 Edge / Chrome 的登录态**。
+    有 3 种连接模式可选（`--mode`）：
 
-        1. 打开 https://docs.qq.com/desktop  寻找标题包含「骓特C6」的文档。
-        2. 进入该文档，根据是「在线表格」还是「在线文档」分别抽取内容。
-        3. 将结果整理为 Python list，并同时落盘成 JSON / CSV，方便后续处理。
+      * clone（默认，推荐）
+            把登录所需的 Cookies / Local State 等少量文件从本机
+            Edge/Chrome 的 user-data-dir 克隆到一个临时目录，
+            Playwright 用这份独立的 profile 启动浏览器。
+            这样即使你本机 Edge 还在后台运行也不会冲突。
+
+      * share
+            直接把本机 Edge/Chrome 的 user-data-dir 借给 Playwright 用
+            （Playwright 官方做法）。**必须**先把所有 Edge/Chrome 进程
+            （包括后台 / Edge Update / 侧栏 / Widget 等）杀干净。
+            否则会 `exitCode=21 (PROFILE_IN_USE)`。
+
+      * attach
+            连接到一个你自己手动启动的、开启了远程调试端口的浏览器：
+
+                msedge.exe --remote-debugging-port=9222
+
+            然后运行：
+
+                python fetch_zhuite_c6.py --mode attach --cdp-port 9222
 
 使用方法（Windows，PowerShell）：
 
-    # 0. 在 D:\\CUSOR_WS\\Bike_Thinker 下放置本脚本
     cd D:\\CUSOR_WS\\Bike_Thinker
 
-    # 1. 安装依赖
     python -m venv .venv
     .venv\\Scripts\\Activate.ps1
     pip install -r requirements.txt
     python -m playwright install
 
-    # 2. （重要）先关闭所有 Edge / Chrome 窗口，
-    #    否则 Playwright 无法复用同一个 user-data-dir。
-    # 3. 运行
+    # 默认：clone 模式，最省事
     python fetch_zhuite_c6.py
 
-    #    如果想用 Chrome：
+    # Chrome 用户：
     python fetch_zhuite_c6.py --browser chrome
-    #    如果你的浏览器使用了非默认 profile：
+    # 非默认 profile（比如 "Profile 1"）：
     python fetch_zhuite_c6.py --profile "Profile 1"
-    #    想看着浏览器跑：
+    # 看着浏览器跑：
     python fetch_zhuite_c6.py --headed
 
 输出文件：
@@ -45,7 +57,9 @@ import csv
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -61,8 +75,27 @@ from playwright.sync_api import (
 DOC_TITLE_KEYWORD = "骓特C6"
 DESKTOP_URL = "https://docs.qq.com/desktop/"
 
+# 克隆 profile 时需要复制的文件（保留登录 Cookie 与解密密钥即可，量很小）
+TOP_LEVEL_FILES = ["Local State"]
+PROFILE_FILES = [
+    "Cookies",
+    "Cookies-journal",
+    "Cookies-wal",
+    "Cookies-shm",
+    "Login Data",
+    "Login Data-journal",
+    "Preferences",
+    "Secure Preferences",
+    "Web Data",
+    "Web Data-journal",
+    "Network/Cookies",
+    "Network/Cookies-journal",
+    "Network/Network Persistent State",
+    "Network/Trust Tokens",
+]
 
-def default_user_data_dir(browser: str, profile: str) -> Path:
+
+def default_user_data_dir(browser: str) -> Path:
     """返回当前操作系统下浏览器默认的 user-data-dir。"""
     home = Path.home()
     if sys.platform.startswith("win"):
@@ -80,14 +113,76 @@ def default_user_data_dir(browser: str, profile: str) -> Path:
     return home / ".config" / "google-chrome"
 
 
+def clone_profile(src: Path, profile: str) -> Path:
+    """把 src/<profile> 下的登录相关文件复制到一个临时 user-data-dir 中并返回。
+    复制目标固定在 %TEMP%\\bike_thinker_browser_profile，多次运行可复用。"""
+    dst = Path(tempfile.gettempdir()) / "bike_thinker_browser_profile"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    # 移除可能残留的 SingletonLock / SingletonCookie / SingletonSocket
+    for stale in dst.glob("Singleton*"):
+        try:
+            stale.unlink()
+        except Exception:
+            pass
+
+    if not src.exists():
+        raise RuntimeError(
+            f"找不到源浏览器用户数据目录：{src}\n"
+            f"请用 --user-data-dir 显式指定，或确认 --browser/--profile 参数正确。"
+        )
+
+    src_profile = src / profile
+    if not src_profile.exists():
+        raise RuntimeError(
+            f"找不到 profile 目录：{src_profile}\n"
+            f"请用 --profile 指定正确名称（Edge 默认是 Default，第二个 profile 通常是 'Profile 1'）。"
+        )
+
+    # 顶层文件
+    for f in TOP_LEVEL_FILES:
+        s = src / f
+        if s.exists():
+            try:
+                shutil.copy2(s, dst / f)
+            except Exception as e:
+                print(f"[WARN] 复制 {s} 失败：{e}", file=sys.stderr)
+
+    # profile 内文件
+    dst_profile = dst / profile
+    (dst_profile / "Network").mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for f in PROFILE_FILES:
+        s = src_profile / f
+        if s.exists():
+            d = dst_profile / f
+            d.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(s, d)
+                copied += 1
+            except Exception as e:
+                print(f"[WARN] 复制 {s} 失败：{e}", file=sys.stderr)
+
+    if copied == 0:
+        raise RuntimeError(
+            f"源 profile {src_profile} 里没有发现可复制的登录文件。"
+            f"请确认你确实用过该浏览器登录腾讯文档。"
+        )
+
+    print(f"[OK] 已克隆 profile 到 {dst}（复制了 {copied} 个文件）")
+    return dst
+
+
 def launch_context(
     p, browser: str, user_data_dir: Path, headed: bool, profile: str
 ) -> BrowserContext:
-    """启动一个复用本机登录态的浏览器上下文。"""
+    """启动一个 Playwright 持久化上下文。"""
     channel = "msedge" if browser == "edge" else "chrome"
     args = [
         f"--profile-directory={profile}",
         "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
     ]
     return p.chromium.launch_persistent_context(
         user_data_dir=str(user_data_dir),
@@ -98,23 +193,33 @@ def launch_context(
     )
 
 
+def connect_cdp(p, port: int) -> BrowserContext:
+    """连接到用户手动启动的、开启远程调试的浏览器。"""
+    endpoint = f"http://127.0.0.1:{port}"
+    browser = p.chromium.connect_over_cdp(endpoint)
+    if not browser.contexts:
+        raise RuntimeError(
+            f"通过 {endpoint} 连接到浏览器，但没有任何上下文。请确认浏览器至少打开了一个窗口。"
+        )
+    return browser.contexts[0]
+
+
 def find_document_url(context: BrowserContext, keyword: str) -> str:
     """在腾讯文档桌面页搜索文档，返回第一个匹配项的 URL。"""
     page = context.new_page()
-    page.goto(DESKTOP_URL, wait_until="domcontentloaded")
+    page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
 
-    # 若未登录则给出明确报错
     try:
         page.wait_for_url(re.compile(r"docs\.qq\.com/desktop"), timeout=15_000)
     except PWTimeoutError:
         raise RuntimeError(
-            "未能进入腾讯文档桌面页，可能浏览器未登录。请先在本机浏览器登录 "
-            "https://docs.qq.com，并关闭所有该浏览器窗口后重试。"
+            "未能进入腾讯文档桌面页，可能克隆的 profile 没有带上有效登录。\n"
+            "请确认本机浏览器是用同一个 profile 登录 https://docs.qq.com 的，"
+            "或改用 --mode attach 直接连接已登录的浏览器。"
         )
 
     page.wait_for_load_state("networkidle", timeout=30_000)
 
-    # 优先用顶部搜索框筛选
     search_selectors = [
         'input[placeholder*="搜索"]',
         'input[type="search"]',
@@ -135,11 +240,9 @@ def find_document_url(context: BrowserContext, keyword: str) -> str:
 
     page.wait_for_timeout(2500)
 
-    # 查找标题包含关键字的链接
     candidates = page.locator(f'a:has-text("{keyword}")')
     count = candidates.count()
     if count == 0:
-        # 兜底：滚动加载列表后再找一次
         for _ in range(5):
             page.mouse.wheel(0, 1500)
             page.wait_for_timeout(800)
@@ -152,7 +255,6 @@ def find_document_url(context: BrowserContext, keyword: str) -> str:
             f"（搜索框{'已使用' if used_search else '未找到'}）"
         )
 
-    # 取第一个 href 包含 docs.qq.com 的
     for i in range(count):
         href = candidates.nth(i).get_attribute("href") or ""
         if "docs.qq.com" in href or href.startswith("/"):
@@ -166,20 +268,16 @@ def find_document_url(context: BrowserContext, keyword: str) -> str:
 
 
 def extract_sheet(page: Page) -> list[list[str]]:
-    """抽取在线表格内容。腾讯文档表格的可见单元格在 canvas 中渲染，
-    但顶部 DOM 里仍能拿到完整数据；我们通过 window 全局变量 + 选择全部复制
-    两条路径中较稳的一条——直接读取单元格 DOM 的 textContent。"""
+    """抽取在线表格内容。"""
     page.wait_for_load_state("networkidle", timeout=60_000)
     page.wait_for_timeout(2500)
 
-    # 等表格容器渲染
     page.wait_for_selector(
         '#alloy-simple-spreadsheet, .alloy-simple-spreadsheet, '
         '[class*="sheet"] canvas',
         timeout=30_000,
     )
 
-    # 通过键盘 Ctrl+A、Ctrl+C 然后从剪贴板拿数据
     page.keyboard.press("Control+A")
     page.wait_for_timeout(300)
     page.keyboard.press("Control+C")
@@ -192,7 +290,6 @@ def extract_sheet(page: Page) -> list[list[str]]:
         text = ""
 
     if not text:
-        # 兜底：抓取所有 textarea / 单元格 DOM
         text = page.evaluate(
             """
             () => {
@@ -215,9 +312,10 @@ def extract_doc(page: Page) -> list[str]:
     page.wait_for_load_state("networkidle", timeout=60_000)
     page.wait_for_timeout(2500)
 
-    # 腾讯文档的正文区域
     try:
-        page.wait_for_selector(".doc, .editor-body, [contenteditable='true']", timeout=30_000)
+        page.wait_for_selector(
+            ".doc, .editor-body, [contenteditable='true']", timeout=30_000
+        )
     except PWTimeoutError:
         pass
 
@@ -241,19 +339,41 @@ def extract_doc(page: Page) -> list[str]:
     return [p for p in paragraphs if p]
 
 
-def fetch(args: argparse.Namespace) -> dict[str, Any]:
-    user_data_dir = Path(args.user_data_dir) if args.user_data_dir else default_user_data_dir(args.browser, args.profile)
-    if not user_data_dir.exists():
-        raise RuntimeError(
-            f"找不到浏览器用户数据目录：{user_data_dir}\n"
-            f"可用 --user-data-dir 显式指定。"
-        )
+def resolve_user_data_dir(args: argparse.Namespace) -> Path:
+    """根据 --mode / --user-data-dir 决定真正给 Playwright 用的目录。"""
+    src = (
+        Path(args.user_data_dir)
+        if args.user_data_dir
+        else default_user_data_dir(args.browser)
+    )
 
+    if args.mode == "share":
+        if not src.exists():
+            raise RuntimeError(f"找不到浏览器用户数据目录：{src}")
+        print(
+            "[WARN] share 模式要求所有 Edge/Chrome 进程已退出，否则会 exitCode=21。\n"
+            "       建议改用默认的 clone 模式：去掉 --mode share。"
+        )
+        return src
+
+    # 默认 clone
+    return clone_profile(src, args.profile)
+
+
+def fetch(args: argparse.Namespace) -> dict[str, Any]:
     with sync_playwright() as p:
-        ctx = launch_context(p, args.browser, user_data_dir, args.headed, args.profile)
-        # 给剪贴板权限，便于读取表格内容
+        if args.mode == "attach":
+            ctx = connect_cdp(p, args.cdp_port)
+        else:
+            user_data_dir = resolve_user_data_dir(args)
+            ctx = launch_context(
+                p, args.browser, user_data_dir, args.headed, args.profile
+            )
+
         try:
-            ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://docs.qq.com")
+            ctx.grant_permissions(
+                ["clipboard-read", "clipboard-write"], origin="https://docs.qq.com"
+            )
         except Exception:
             pass
 
@@ -262,7 +382,7 @@ def fetch(args: argparse.Namespace) -> dict[str, Any]:
             print(f"[OK] 找到文档：{url}")
 
             page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded")
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_load_state("networkidle", timeout=60_000)
             time.sleep(2)
 
@@ -286,7 +406,14 @@ def fetch(args: argparse.Namespace) -> dict[str, Any]:
 
             return result
         finally:
-            ctx.close()
+            try:
+                if args.mode == "attach":
+                    # attach 模式不要关浏览器，留给用户
+                    pass
+                else:
+                    ctx.close()
+            except Exception:
+                pass
 
 
 def save(result: dict[str, Any], out_dir: Path) -> None:
@@ -308,13 +435,35 @@ def save(result: dict[str, Any], out_dir: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="抓取腾讯文档「骓特C6」并整理为列表")
-    parser.add_argument("--browser", choices=["edge", "chrome"], default="edge",
-                        help="使用哪个本机浏览器复用登录态（默认 edge）")
-    parser.add_argument("--profile", default="Default",
-                        help='浏览器 profile 目录名，默认 "Default"，常见还有 "Profile 1"')
-    parser.add_argument("--user-data-dir", default=None,
-                        help="显式指定浏览器 user-data-dir 路径，覆盖自动探测")
+    parser = argparse.ArgumentParser(
+        description="抓取腾讯文档「骓特C6」并整理为列表",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "推荐用法：直接 `python fetch_zhuite_c6.py` 即可（默认 clone 模式，"
+            "不会和你正在运行的 Edge 冲突）。"
+        ),
+    )
+    parser.add_argument(
+        "--browser", choices=["edge", "chrome"], default="edge",
+        help="使用哪个本机浏览器复用登录态（默认 edge）",
+    )
+    parser.add_argument(
+        "--profile", default="Default",
+        help='浏览器 profile 目录名，默认 "Default"，常见还有 "Profile 1"',
+    )
+    parser.add_argument(
+        "--user-data-dir", default=None,
+        help="显式指定浏览器 user-data-dir 路径，覆盖自动探测",
+    )
+    parser.add_argument(
+        "--mode", choices=["clone", "share", "attach"], default="clone",
+        help="登录态复用方式：clone 克隆 profile（默认）/ share 直接借用（需关闭浏览器）"
+             " / attach 连接到带 --remote-debugging-port 的现成浏览器",
+    )
+    parser.add_argument(
+        "--cdp-port", type=int, default=9222,
+        help="attach 模式下连接的远程调试端口（默认 9222）",
+    )
     parser.add_argument("--headed", action="store_true",
                         help="显示浏览器界面（便于排查问题）")
     parser.add_argument("--out", default=".", help="输出目录，默认当前目录")
@@ -323,10 +472,24 @@ def main() -> int:
     try:
         result = fetch(args)
     except Exception as e:
-        print(f"[ERR] {e}", file=sys.stderr)
+        msg = str(e)
+        print(f"[ERR] {msg}", file=sys.stderr)
+        if "has been closed" in msg or "exitCode=21" in msg or "Profile" in msg:
+            print(
+                "\n排错建议：\n"
+                "  * 你大概率遇到了 Edge/Chrome 的 user-data-dir 被占用（exitCode=21）。\n"
+                "  * 默认 clone 模式应该已经避免了这个问题；如果你显式加了 --mode share，请去掉。\n"
+                "  * 仍然失败时，尝试：\n"
+                "      1) 任务管理器里彻底结束所有 msedge.exe 进程后重试；\n"
+                "      2) 或者手动启动一个调试 Edge：\n"
+                "             \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" "
+                "--remote-debugging-port=9222\n"
+                "         在该 Edge 里登录腾讯文档，然后另开终端运行：\n"
+                "             python fetch_zhuite_c6.py --mode attach --cdp-port 9222\n",
+                file=sys.stderr,
+            )
         return 1
 
-    # 控制台打印精简列表预览
     if result["type"] == "sheet":
         rows = result["rows"]
         print(f"[INFO] 表格共 {len(rows)} 行，预览前 5 行：")
