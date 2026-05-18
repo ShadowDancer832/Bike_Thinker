@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+zhuite_c6.json
+zhuite_c6.csv
