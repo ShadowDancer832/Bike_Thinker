@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
 import os
 import re
@@ -113,6 +114,70 @@ def default_user_data_dir(browser: str) -> Path:
     return home / ".config" / "google-chrome"
 
 
+def _win_copy_shared(src: Path, dst: Path) -> None:
+    """在 Windows 上用 CreateFileW + 全部 FILE_SHARE_* 旗标去读源文件，
+    然后写到 dst。比 shutil.copy2 更能绕开 Edge 持有的非独占锁。
+    若 Edge 用 FILE_SHARE_NONE 锁住文件，此方法仍会失败。"""
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004  # read|write|delete
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CreateFileW = k32.CreateFileW
+    CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    CreateFileW.restype = wintypes.HANDLE
+    ReadFile = k32.ReadFile
+    ReadFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    ReadFile.restype = wintypes.BOOL
+    CloseHandle = k32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    handle = CreateFileW(
+        str(src), GENERIC_READ, FILE_SHARE_ALL, None,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None,
+    )
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        err = ctypes.get_last_error()
+        raise OSError(err, f"CreateFileW failed (WinErr {err}) for {src}")
+    try:
+        BUFSIZE = 1024 * 1024
+        buf = (ctypes.c_ubyte * BUFSIZE)()
+        with open(dst, "wb") as out:
+            while True:
+                got = wintypes.DWORD(0)
+                ok = ReadFile(handle, buf, BUFSIZE, ctypes.byref(got), None)
+                if not ok:
+                    err = ctypes.get_last_error()
+                    raise OSError(err, f"ReadFile failed (WinErr {err}) for {src}")
+                if got.value == 0:
+                    break
+                out.write(bytes(buf[: got.value]))
+    finally:
+        CloseHandle(handle)
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    """先尝试 shutil.copy2；Windows 上若被独占锁挡了，则降级到 CreateFileW 共享读取。"""
+    try:
+        shutil.copy2(src, dst)
+        return
+    except PermissionError:
+        if not sys.platform.startswith("win"):
+            raise
+    _win_copy_shared(src, dst)
+
+
 def clone_profile(src: Path, profile: str) -> Path:
     """把 src/<profile> 下的登录相关文件复制到一个临时 user-data-dir 中并返回。
     复制目标固定在 %TEMP%\\bike_thinker_browser_profile，多次运行可复用。"""
@@ -139,35 +204,56 @@ def clone_profile(src: Path, profile: str) -> Path:
             f"请用 --profile 指定正确名称（Edge 默认是 Default，第二个 profile 通常是 'Profile 1'）。"
         )
 
+    failed_critical: list[Path] = []
+
     # 顶层文件
     for f in TOP_LEVEL_FILES:
         s = src / f
         if s.exists():
             try:
-                shutil.copy2(s, dst / f)
+                _copy_file(s, dst / f)
             except Exception as e:
                 print(f"[WARN] 复制 {s} 失败：{e}", file=sys.stderr)
+                if f == "Local State":
+                    failed_critical.append(s)
 
     # profile 内文件
     dst_profile = dst / profile
     (dst_profile / "Network").mkdir(parents=True, exist_ok=True)
     copied = 0
+    cookies_copied = False
     for f in PROFILE_FILES:
         s = src_profile / f
         if s.exists():
             d = dst_profile / f
             d.parent.mkdir(parents=True, exist_ok=True)
             try:
-                shutil.copy2(s, d)
+                _copy_file(s, d)
                 copied += 1
+                if f in ("Cookies", "Network/Cookies"):
+                    cookies_copied = True
             except Exception as e:
                 print(f"[WARN] 复制 {s} 失败：{e}", file=sys.stderr)
+                if f in ("Cookies", "Network/Cookies"):
+                    failed_critical.append(s)
 
     if copied == 0:
         raise RuntimeError(
             f"源 profile {src_profile} 里没有发现可复制的登录文件。"
             f"请确认你确实用过该浏览器登录腾讯文档。"
         )
+
+    if not cookies_copied:
+        msg = (
+            "关键的 Cookies 文件没能复制下来——你本机 Edge 正在用它（独占锁），\n"
+            "Windows 不允许另一个进程读取。请改用下面任一方式：\n"
+            "  (A) 推荐：用 attach 模式，不需要复制任何文件\n"
+            "        1) & \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" "
+            "--remote-debugging-port=9222\n"
+            "        2) python fetch_zhuite_c6.py --mode attach --cdp-port 9222\n"
+            "  (B) 任务管理器结束所有 msedge.exe 进程，然后重跑本脚本。"
+        )
+        raise RuntimeError(msg)
 
     print(f"[OK] 已克隆 profile 到 {dst}（复制了 {copied} 个文件）")
     return dst
